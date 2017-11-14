@@ -781,7 +781,26 @@ func TestShard_CreateIterator_Series_Auth(t *testing.T) {
 	var sh *Shard
 	var itr query.Iterator
 
-	test := func(index string) error {
+	type variant struct {
+		name string
+		m    *influxql.Measurement
+		aux  []influxql.VarRef
+	}
+
+	examples := []variant{
+		{
+			name: "use_index",
+			m:    &influxql.Measurement{Name: "cpu"},
+			aux:  []influxql.VarRef{{Val: "_seriesKey", Type: influxql.String}},
+		},
+		{
+			name: "use_cursors",
+			m:    &influxql.Measurement{Name: "cpu", SystemIterator: "_series"},
+			aux:  []influxql.VarRef{{Val: "key", Type: influxql.String}},
+		},
+	}
+
+	test := func(index string, v variant) error {
 		sh = MustNewOpenShard(index)
 		sh.MustWritePointsString(`
 cpu,host=serverA,region=uswest value=100 0
@@ -803,9 +822,8 @@ cpu,secret=foo value=100 0
 		// Create iterator for case where we use cursors (e.g., where time
 		// included in a SHOW SERIES query).
 		var err error
-		m := &influxql.Measurement{Name: "cpu"}
-		itr, err = sh.CreateIterator(context.Background(), m, query.IteratorOptions{
-			Aux:        []influxql.VarRef{{Val: "_seriesKey", Type: influxql.String}},
+		itr, err = sh.CreateIterator(context.Background(), v.m, query.IteratorOptions{
+			Aux:        v.aux,
 			Ascending:  true,
 			StartTime:  influxql.MinTime,
 			EndTime:    influxql.MaxTime,
@@ -820,55 +838,13 @@ cpu,secret=foo value=100 0
 		}
 
 		fitr := itr.(query.FloatIterator)
+		defer fitr.Close()
 		var expCount = 2
 		var gotCount int
 		for {
 			f, err := fitr.Next()
 			if err != nil {
-				fitr.Close()
-				t.Fatal(err)
-			}
-
-			if f == nil {
-				break
-			}
-
-			if got := f.Aux[0].(string); strings.Contains(got, "secret") {
-				fitr.Close()
-				return fmt.Errorf("got a series %q that should be filtered", got)
-			}
-			gotCount++
-		}
-
-		if gotCount != expCount {
-			return fmt.Errorf("got %d series, expected %d", gotCount, expCount)
-		}
-
-		if err := fitr.Close(); err != nil {
-			return err
-		}
-
-		// Create and iterator for the case where we exclusively use the index,
-		// e.g., SHOW SERIES.
-		m.SystemIterator = "_series"
-		itr, err = sh.CreateIterator(context.Background(), m, query.IteratorOptions{
-			Aux:        []influxql.VarRef{{Val: "key", Type: influxql.String}},
-			Ascending:  true,
-			StartTime:  influxql.MinTime,
-			EndTime:    influxql.MaxTime,
-			Authorizer: seriesAuthorizer,
-		})
-		if err != nil {
-			return err
-		}
-
-		fitr = itr.(query.FloatIterator)
-		gotCount = 0
-		defer fitr.Close()
-		for {
-			f, err := fitr.Next()
-			if err != nil {
-				t.Fatal(err)
+				return err
 			}
 
 			if f == nil {
@@ -888,11 +864,13 @@ cpu,secret=foo value=100 0
 	}
 
 	for _, index := range tsdb.RegisteredIndexes() {
-		t.Run(index, func(t *testing.T) {
-			if err := test(index); err != nil {
-				t.Fatal(err)
-			}
-		})
+		for _, example := range examples {
+			t.Run(index+"_"+example.name, func(t *testing.T) {
+				if err := test(index, example); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 		sh.Close()
 		itr.Close()
 	}
